@@ -27,8 +27,8 @@ LLM_REQUEST_TIMEOUT = 180
 
 
 def _validate_and_retry_json_schema(
-    response_text: str, json_schema: type[BaseModel] | dict | None, attempt: int
-) -> tuple[str, bool]:
+    response_text: str | dict | None, json_schema: type[BaseModel] | dict | None, attempt: int
+) -> tuple[str | dict, bool]:
     """
     JSONスキーマの検証とリトライ判定を行う
 
@@ -43,33 +43,98 @@ def _validate_and_retry_json_schema(
     if not json_schema:
         return response_text, False
 
+    # 空文字・None・空白のみの応答はリトライ対象
+    if response_text is None or (isinstance(response_text, str) and not response_text.strip()):
+        logging.warning(
+            f"Empty or None response received (attempt {attempt}). "
+            f"Response: {repr(response_text)}"
+        )
+        return response_text, True
+
     # Pydantic BaseModelの場合
     if isinstance(json_schema, type) and issubclass(json_schema, BaseModel):
         try:
             # 既にパース済みの場合はそのまま返す
             if isinstance(response_text, dict):
+                # Pydanticで検証
+                json_schema.model_validate(response_text)
                 return response_text, False
 
-            # JSONとしてパース試行
-            parsed = json_schema.model_validate_json(response_text)
-            return parsed.model_dump(), False
-        except (ValidationError, json.JSONDecodeError) as e:
+            # 文字列の場合、JSONとしてパース＆検証
+            if isinstance(response_text, str):
+                parsed = json_schema.model_validate_json(response_text)
+                return parsed.model_dump(), False
+
+            logging.warning(f"Unexpected response type: {type(response_text)}, value: {repr(response_text)}")
+            return response_text, True
+
+        except ValidationError as e:
+            # バリデーションエラーの詳細をログに記録
+            error_details = []
+            for error in e.errors():
+                error_details.append(f"{error['loc']}: {error['msg']}")
+
             logging.warning(
-                f"JSON schema validation failed (attempt {attempt}): {e}\n"
-                f"Response text: {response_text[:500]}..."
+                f"JSON schema validation failed (attempt {attempt}):\n"
+                f"Errors: {'; '.join(error_details)}\n"
+                f"Response (first 500 chars): {str(response_text)[:500]}\n"
+                f"Response (full length): {len(str(response_text))} characters"
+            )
+            # 全文を DEBUG レベルで記録
+            logging.debug(f"Full response text:\n{response_text}")
+            return response_text, True
+
+        except json.JSONDecodeError as e:
+            # 部分的なJSONや不正なJSON形式
+            logging.warning(
+                f"JSON decode failed (attempt {attempt}): {e}\n"
+                f"Error at position {e.pos}: {e.msg}\n"
+                f"Response (first 500 chars): {str(response_text)[:500]}\n"
+                f"Response (full length): {len(str(response_text))} characters"
+            )
+            logging.debug(f"Full response text:\n{response_text}")
+            return response_text, True
+
+        except Exception as e:
+            # その他の予期しないエラー
+            logging.error(
+                f"Unexpected error during validation (attempt {attempt}): {type(e).__name__}: {e}\n"
+                f"Response: {repr(response_text)}"
             )
             return response_text, True
 
     # 辞書形式のスキーマの場合
     if isinstance(json_schema, dict):
         try:
+            # 空の応答チェック（再度）
+            if not response_text or (isinstance(response_text, str) and not response_text.strip()):
+                logging.warning(f"Empty response for dict schema (attempt {attempt})")
+                return response_text, True
+
             # JSONとしてパース可能かチェック
             if isinstance(response_text, str):
-                json.loads(response_text)
-            return response_text, False
+                parsed = json.loads(response_text)
+                return parsed, False
+            elif isinstance(response_text, dict):
+                return response_text, False
+            else:
+                logging.warning(f"Unexpected type for dict schema: {type(response_text)}")
+                return response_text, True
+
         except json.JSONDecodeError as e:
             logging.warning(
-                f"JSON parsing failed (attempt {attempt}): {e}\n" f"Response text: {response_text[:500]}..."
+                f"JSON parsing failed (attempt {attempt}): {e}\n"
+                f"Error at position {e.pos}: {e.msg}\n"
+                f"Response (first 500 chars): {str(response_text)[:500]}\n"
+                f"Response (full length): {len(str(response_text))} characters"
+            )
+            logging.debug(f"Full response text:\n{response_text}")
+            return response_text, True
+
+        except Exception as e:
+            logging.error(
+                f"Unexpected error parsing dict schema (attempt {attempt}): {type(e).__name__}: {e}\n"
+                f"Response: {repr(response_text)}"
             )
             return response_text, True
 
@@ -220,17 +285,26 @@ def request_to_openai(
             last_error = e
             logging.error(
                 f"[OpenAI] Unexpected error (attempt {attempt}/{max_retries}): {type(e).__name__}: {e}, "
-                f"model={model}"
+                f"model={model}",
+                exc_info=True,
             )
             if attempt == max_retries:
                 raise
+            # リトライ前に待機
+            time.sleep(2**attempt)
 
-    # すべてのリトライが失敗した場合
-    error_msg = f"Failed to get valid JSON response after {max_retries} attempts"
+    # すべてのリトライが失敗した場合（JSONスキーマ検証のみが失敗し続けた場合）
+    error_msg = (
+        f"[OpenAI] Failed to get valid JSON response after {max_retries} attempts. "
+        f"Model: {model}, JSON schema required: {json_schema is not None}"
+    )
+    logging.error(error_msg)
     if last_error:
-        error_msg += f": {last_error}"
-    logging.error(f"[OpenAI] {error_msg}")
-    raise RuntimeError(error_msg)
+        # 元のエラーをチェーンして、スタックトレースを保持
+        raise RuntimeError(error_msg) from last_error
+    else:
+        # 検証エラーのみの場合は詳細を含める
+        raise RuntimeError(f"{error_msg}. Last response did not match expected JSON schema.")
 
 
 @retry(

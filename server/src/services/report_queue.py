@@ -166,7 +166,7 @@ class ReportQueueManager:
         config_path = job.get("config_path")
         user_api_key = job.get("user_api_key")
 
-        logger.info(f"Processing report: {slug}")
+        logger.info(f"[Queue] Processing report: {slug}")
 
         try:
             # ロックファイルを作成
@@ -186,19 +186,75 @@ class ReportQueueManager:
             retcode = process.wait()
 
             if retcode == 0:
-                logger.info(f"Report {slug} completed successfully")
-                # ストレージ同期は report_launcher.py の _monitor_process で処理される
+                logger.info(f"[Queue] Report {slug} completed successfully, performing post-processing")
+                self._handle_success(slug)
             else:
-                logger.error(f"Report {slug} failed with return code {retcode}")
+                logger.error(f"[Queue] Report {slug} failed with return code {retcode}")
                 set_status(slug, "error")
 
         except Exception as e:
-            logger.error(f"Error processing job {slug}: {e}", exc_info=True)
+            logger.error(f"[Queue] Error processing job {slug}: {e}", exc_info=True)
             set_status(slug, "error")
 
         finally:
             # ロックファイルを削除
             self._remove_lock()
+
+    def _handle_success(self, slug: str):
+        """
+        レポート生成成功時の後処理
+        トークン使用量の更新とストレージ同期を実行
+        """
+        try:
+            from src.services.report_status import update_token_usage
+            from src.services.report_sync import ReportSyncService
+
+            # トークン使用量を更新
+            status_file = settings.REPORT_DIR / slug / "hierarchical_status.json"
+            if status_file.exists():
+                with open(status_file) as f:
+                    status_data = json.load(f)
+                    total_token_usage = status_data.get("total_token_usage", 0)
+                    token_usage_input = status_data.get("token_usage_input", 0)
+                    token_usage_output = status_data.get("token_usage_output", 0)
+
+                    config_file = settings.CONFIG_DIR / f"{slug}.json"
+                    provider = None
+                    model = None
+                    if config_file.exists():
+                        with open(config_file) as f:
+                            config_data = json.load(f)
+                            provider = config_data.get("provider")
+                            model = config_data.get("model")
+
+                    logger.info(
+                        f"[Queue] Token usage for {slug}: total={total_token_usage}, "
+                        f"input={token_usage_input}, output={token_usage_output}, "
+                        f"provider={provider}, model={model}"
+                    )
+                    update_token_usage(
+                        slug, total_token_usage, token_usage_input, token_usage_output, provider or None, model or None
+                    )
+            else:
+                logger.warning(f"[Queue] Status file not found for {slug}, skipping token usage update")
+
+        except Exception as e:
+            logger.error(f"[Queue] Error updating token usage for {slug}: {e}", exc_info=True)
+
+        # ステータスを ready に更新
+        set_status(slug, "ready")
+
+        # ストレージ同期
+        try:
+            logger.info(f"[Queue] Syncing files for {slug} to storage")
+            report_sync_service = ReportSyncService()
+            report_sync_service.sync_report_files_to_storage(slug)
+            report_sync_service.sync_input_file_to_storage(slug)
+            report_sync_service.sync_config_file_to_storage(slug)
+            report_sync_service.sync_status_file_to_storage()
+            logger.info(f"[Queue] Storage sync completed for {slug}")
+        except Exception as e:
+            logger.error(f"[Queue] Error syncing files for {slug}: {e}", exc_info=True)
 
     def _create_lock(self, slug: str):
         """ロックファイルを作成"""

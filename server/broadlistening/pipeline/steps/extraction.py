@@ -144,8 +144,15 @@ def extract_batch(
                     else:
                         results[i] = result
                 except Exception as e:
-                    logging.error(f"Task {future} failed with error: {e}")
+                    logging.error(
+                        f"[Extraction] Task {i} failed with error: {type(e).__name__}: {e}",
+                        exc_info=True
+                    )
                     results[i] = []
+            else:
+                # タイムアウトでキャンセルされたタスク
+                logging.warning(f"[Extraction] Task {i} timed out after 200 seconds")
+                results[i] = []
 
         if config is not None:
             config["total_token_usage"] = config.get("total_token_usage", 0) + total_token_usage
@@ -163,6 +170,7 @@ def extract_arguments(input, prompt, model, provider="openai", local_llm_address
         {"role": "system", "content": prompt},
         {"role": "user", "content": input},
     ]
+    response_text = None  # エラー時のログ用
     try:
         response, token_input, token_output, token_total = request_to_chat_ai(
             messages=messages,
@@ -173,12 +181,29 @@ def extract_arguments(input, prompt, model, provider="openai", local_llm_address
             local_llm_address=local_llm_address,
             user_api_key=user_api_key,
         )
+        response_text = response
         items = parse_extraction_response(response)
         items = list(filter(None, items))  # omit empty strings
         return items, token_input, token_output, token_total
+
     except json.decoder.JSONDecodeError as e:
-        print("JSON error:", e)
-        print("Input was:", input)
-        print("Response was:", response)
-        print("Silently giving up on trying to generate valid list.")
-        return []
+        # parse_extraction_response 内でのJSONエラー
+        # request_to_chat_ai で既にリトライ済みのため、ここでは握りつぶさずログを残して空リストを返す
+        logging.error(
+            f"[Extraction] JSON parse error after all retries: {e}\n"
+            f"Input (first 200 chars): {input[:200]}\n"
+            f"Response (first 500 chars): {str(response_text)[:500] if response_text else 'None'}",
+            exc_info=True
+        )
+        return [], 0, 0, 0
+
+    except Exception as e:
+        # その他の予期しないエラー
+        logging.error(
+            f"[Extraction] Unexpected error: {type(e).__name__}: {e}\n"
+            f"Input (first 200 chars): {input[:200]}\n"
+            f"Model: {model}, Provider: {provider}",
+            exc_info=True
+        )
+        # 予期しないエラーは再スロー
+        raise
