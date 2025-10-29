@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -52,11 +53,26 @@ def hierarchical_merge_labelling(config: dict) -> None:
                 - prompt: LLMへのプロンプト
                 - model: 使用するLLMモデル名
                 - workers: 並列処理のワーカー数
+                - ai_config: フェーズ固有のAI設定（オプション）
             - provider: LLMプロバイダー
     """
     dataset = config["output_dir"]
     merge_path = f"outputs/{dataset}/hierarchical_merge_labels.csv"
     clusters_df = pd.read_csv(f"outputs/{dataset}/hierarchical_initial_labels.csv")
+
+    # フェーズ固有のAI設定を取得（なければデフォルト設定を使用）
+    merge_labelling_config = config["hierarchical_merge_labelling"]
+    ai_config = merge_labelling_config.get("ai_config", {})
+    model = ai_config.get("model") or merge_labelling_config.get("model") or config["model"]
+    provider = ai_config.get("provider") or config["provider"]
+    user_api_key = ai_config.get("user_api_key") or config.get("user_api_key")
+
+    logging.info(f"[MergeLabelling] Using provider={provider}, model={model}")
+
+    # モデルとプロバイダーをconfigに設定（merge_labellingで使用するため）
+    config["hierarchical_merge_labelling"]["model"] = model
+    config["hierarchical_merge_labelling"]["provider"] = provider
+    config["hierarchical_merge_labelling"]["user_api_key"] = user_api_key
 
     cluster_id_columns: list[str] = _filter_id_columns(clusters_df.columns)
     # ボトムクラスタのラベル・説明とクラスタid付きの各argumentを入力し、各階層のクラスタラベル・説明を生成し、argumentに付けたdfを作成
@@ -275,9 +291,9 @@ def process_merge_labelling(
             messages=messages,
             model=config["hierarchical_merge_labelling"]["model"],
             json_schema=LabellingFromat,
-            provider=config["provider"],
+            provider=config["hierarchical_merge_labelling"]["provider"],
             local_llm_address=config.get("local_llm_address"),
-            user_api_key=os.getenv("USER_API_KEY"),
+            user_api_key=config["hierarchical_merge_labelling"]["user_api_key"],
         )
 
         config["total_token_usage"] = config.get("total_token_usage", 0) + token_total

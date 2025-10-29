@@ -27,15 +27,23 @@ def _validate_property_columns(property_columns: list[str], comments: pd.DataFra
 def extraction(config):
     dataset = config["output_dir"]
     path = f"outputs/{dataset}/args.csv"
-    model = config["extraction"]["model"]
-    prompt = config["extraction"]["prompt"]
-    workers = config["extraction"]["workers"]
-    limit = config["extraction"]["limit"]
-    property_columns = config["extraction"]["properties"]
 
-    if "provider" not in config:
+    # フェーズ固有のAI設定を取得（なければデフォルト設定を使用）
+    extraction_config = config["extraction"]
+    ai_config = extraction_config.get("ai_config", {})
+    model = ai_config.get("model") or config["model"]
+    provider = ai_config.get("provider") or config["provider"]
+    user_api_key = ai_config.get("user_api_key") or config.get("user_api_key")
+
+    prompt = extraction_config["prompt"]
+    workers = extraction_config["workers"]
+    limit = extraction_config["limit"]
+    property_columns = extraction_config["properties"]
+
+    if not provider:
         raise RuntimeError("provider is not set")
-    provider = config["provider"]
+
+    logging.info(f"[Extraction] Using provider={provider}, model={model}")
 
     # カラム名だけを読み込み、必要なカラムが含まれているか確認する
     comments = pd.read_csv(f"inputs/{config['input']}.csv", nrows=0)
@@ -56,7 +64,14 @@ def extraction(config):
         batch = comment_ids[i : i + workers]
         batch_inputs = [comments.loc[id]["comment-body"] for id in batch]
         batch_results = extract_batch(
-            batch_inputs, prompt, model, workers, provider, config.get("local_llm_address"), config
+            batch_inputs,
+            prompt,
+            model,
+            workers,
+            provider,
+            config.get("local_llm_address"),
+            user_api_key,
+            config,
         )
 
         for comment_id, extracted_args in zip(batch, batch_results, strict=False):
@@ -96,14 +111,17 @@ def extraction(config):
 logging.basicConfig(level=logging.DEBUG)
 
 
-def extract_batch(batch, prompt, model, workers, provider="openai", local_llm_address=None, config=None):
+def extract_batch(
+    batch, prompt, model, workers, provider="openai", local_llm_address=None, user_api_key=None, config=None
+):
     with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
         futures_with_index = [
-            (i, executor.submit(extract_arguments, input, prompt, model, provider, local_llm_address))
+            (i, executor.submit(extract_arguments, input, prompt, model, provider, local_llm_address, user_api_key))
             for i, input in enumerate(batch)
         ]
 
-        done, not_done = concurrent.futures.wait([f for _, f in futures_with_index], timeout=30)
+        # LLMタイムアウトが180秒なので、waitタイムアウトは200秒に設定
+        done, not_done = concurrent.futures.wait([f for _, f in futures_with_index], timeout=200)
         results = [[] for _ in range(len(batch))]
         total_token_input = 0
         total_token_output = 0
@@ -140,7 +158,7 @@ def extract_batch(batch, prompt, model, workers, provider="openai", local_llm_ad
         return results
 
 
-def extract_arguments(input, prompt, model, provider="openai", local_llm_address=None):
+def extract_arguments(input, prompt, model, provider="openai", local_llm_address=None, user_api_key=None):
     messages = [
         {"role": "system", "content": prompt},
         {"role": "user", "content": input},
@@ -153,7 +171,7 @@ def extract_arguments(input, prompt, model, provider="openai", local_llm_address
             json_schema=ExtractionResponse,
             provider=provider,
             local_llm_address=local_llm_address,
-            user_api_key=os.getenv("USER_API_KEY"),
+            user_api_key=user_api_key,
         )
         items = parse_extraction_response(response)
         items = list(filter(None, items))  # omit empty strings

@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import random
@@ -8,7 +9,7 @@ from typing import Any
 import openai
 from dotenv import load_dotenv
 from openai import AzureOpenAI, OpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 from tenacity import retry, retry_if_exception_type, stop_after_attempt, wait_exponential
 
 try:  # Optional dependency
@@ -20,6 +21,88 @@ except ModuleNotFoundError:  # pragma: no cover - library might be unavailable i
 
 DOTENV_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "../../../../.env"))
 load_dotenv(DOTENV_PATH)
+
+# タイムアウト設定: MAX 3分（180秒）
+LLM_REQUEST_TIMEOUT = 180
+
+
+def _validate_and_retry_json_schema(
+    response_text: str, json_schema: type[BaseModel] | dict | None, attempt: int
+) -> tuple[str, bool]:
+    """
+    JSONスキーマの検証とリトライ判定を行う
+
+    Args:
+        response_text: LLMからの応答テキスト
+        json_schema: 期待するJSONスキーマ
+        attempt: 現在のリトライ回数
+
+    Returns:
+        (validated_text, should_retry): 検証済みテキストとリトライすべきかのフラグ
+    """
+    if not json_schema:
+        return response_text, False
+
+    # Pydantic BaseModelの場合
+    if isinstance(json_schema, type) and issubclass(json_schema, BaseModel):
+        try:
+            # 既にパース済みの場合はそのまま返す
+            if isinstance(response_text, dict):
+                return response_text, False
+
+            # JSONとしてパース試行
+            parsed = json_schema.model_validate_json(response_text)
+            return parsed.model_dump(), False
+        except (ValidationError, json.JSONDecodeError) as e:
+            logging.warning(
+                f"JSON schema validation failed (attempt {attempt}): {e}\n"
+                f"Response text: {response_text[:500]}..."
+            )
+            return response_text, True
+
+    # 辞書形式のスキーマの場合
+    if isinstance(json_schema, dict):
+        try:
+            # JSONとしてパース可能かチェック
+            if isinstance(response_text, str):
+                json.loads(response_text)
+            return response_text, False
+        except json.JSONDecodeError as e:
+            logging.warning(
+                f"JSON parsing failed (attempt {attempt}): {e}\n" f"Response text: {response_text[:500]}..."
+            )
+            return response_text, True
+
+    return response_text, False
+
+
+def _modify_messages_for_retry(messages: list[dict], attempt: int) -> list[dict]:
+    """
+    リトライ時にメッセージを修正して、LLMに異なる応答を促す
+
+    Args:
+        messages: 元のメッセージリスト
+        attempt: 現在のリトライ回数
+
+    Returns:
+        修正されたメッセージリスト
+    """
+    modified_messages = messages.copy()
+
+    # 最後のユーザーメッセージにスペースや改行を追加して、わずかに異なる入力にする
+    for i in range(len(modified_messages) - 1, -1, -1):
+        if modified_messages[i].get("role") == "user":
+            content = modified_messages[i].get("content", "")
+            # リトライ回数に応じて異なるサフィックスを追加
+            suffixes = [" ", "\n", "  ", "\n\n", "   "]
+            suffix = suffixes[min(attempt - 1, len(suffixes) - 1)]
+            modified_messages[i] = {
+                **modified_messages[i],
+                "content": content + suffix,
+            }
+            break
+
+    return modified_messages
 
 
 @retry(
@@ -42,59 +125,112 @@ def request_to_openai(
 
     client = OpenAI(api_key=user_api_key) if user_api_key else OpenAI()
 
-    try:
-        if isinstance(json_schema, type) and issubclass(json_schema, BaseModel):
-            # Use beta.chat.completions.create for Pydantic BaseModel
-            response = client.beta.chat.completions.parse(
-                model=model,
-                messages=messages,
-                temperature=0,
-                n=1,
-                seed=0,
-                response_format=json_schema,
-                timeout=30,
+    # JSONスキーマ検証エラーに対するリトライループ（最大5回）
+    max_retries = 5
+    last_error = None
+
+    for attempt in range(1, max_retries + 1):
+        try:
+            # リトライ時はメッセージをわずかに変更
+            current_messages = _modify_messages_for_retry(messages, attempt) if attempt > 1 else messages
+
+            if isinstance(json_schema, type) and issubclass(json_schema, BaseModel):
+                # Use beta.chat.completions.create for Pydantic BaseModel
+                logging.info(
+                    f"[OpenAI] Requesting with model={model}, json_schema={json_schema.__name__}, "
+                    f"attempt={attempt}/{max_retries}"
+                )
+                response = client.beta.chat.completions.parse(
+                    model=model,
+                    messages=current_messages,
+                    temperature=0,
+                    n=1,
+                    seed=0,
+                    response_format=json_schema,
+                    timeout=LLM_REQUEST_TIMEOUT,
+                )
+                if hasattr(response, "usage") and response.usage:
+                    token_usage_input = response.usage.prompt_tokens or 0
+                    token_usage_output = response.usage.completion_tokens or 0
+                    token_usage_total = response.usage.total_tokens or 0
+
+                response_text = response.choices[0].message.content
+                validated_text, should_retry = _validate_and_retry_json_schema(response_text, json_schema, attempt)
+
+                if not should_retry or attempt == max_retries:
+                    logging.info(f"[OpenAI] Request successful (attempt {attempt}), tokens: {token_usage_total}")
+                    return validated_text, token_usage_input, token_usage_output, token_usage_total
+
+                logging.warning(f"[OpenAI] Retrying due to JSON schema validation failure (attempt {attempt})")
+                time.sleep(2**attempt)  # 指数バックオフ
+                continue
+
+            else:
+                response_format = None
+                if is_json:
+                    response_format = {"type": "json_object"}
+                if json_schema:  # 両方有効化されていたら、json_schemaを優先
+                    response_format = json_schema
+
+                logging.info(
+                    f"[OpenAI] Requesting with model={model}, is_json={is_json}, " f"attempt={attempt}/{max_retries}"
+                )
+
+                payload = {
+                    "model": model,
+                    "messages": current_messages,
+                    "temperature": 0,
+                    "n": 1,
+                    "seed": 0,
+                    "timeout": LLM_REQUEST_TIMEOUT,
+                }
+                if response_format:
+                    payload["response_format"] = response_format
+
+                response = client.chat.completions.create(**payload)
+
+                if hasattr(response, "usage") and response.usage:
+                    token_usage_input = response.usage.prompt_tokens or 0
+                    token_usage_output = response.usage.completion_tokens or 0
+                    token_usage_total = response.usage.total_tokens or 0
+
+                response_text = response.choices[0].message.content
+                validated_text, should_retry = _validate_and_retry_json_schema(response_text, json_schema, attempt)
+
+                if not should_retry or attempt == max_retries:
+                    logging.info(f"[OpenAI] Request successful (attempt {attempt}), tokens: {token_usage_total}")
+                    return validated_text, token_usage_input, token_usage_output, token_usage_total
+
+                logging.warning(f"[OpenAI] Retrying due to JSON validation failure (attempt {attempt})")
+                time.sleep(2**attempt)  # 指数バックオフ
+                continue
+
+        except openai.RateLimitError as e:
+            logging.warning(f"[OpenAI] API rate limit hit (attempt {attempt}): {e}")
+            raise
+        except openai.AuthenticationError as e:
+            logging.error(f"[OpenAI] API authentication error: {str(e)}, model={model}")
+            raise
+        except openai.BadRequestError as e:
+            logging.error(
+                f"[OpenAI] API bad request error: {str(e)}, model={model}, " f"messages={messages[:100]}..."
             )
-            if hasattr(response, "usage") and response.usage:
-                token_usage_input = response.usage.prompt_tokens or 0
-                token_usage_output = response.usage.completion_tokens or 0
-                token_usage_total = response.usage.total_tokens or 0
-            return response.choices[0].message.content, token_usage_input, token_usage_output, token_usage_total
+            raise
+        except Exception as e:
+            last_error = e
+            logging.error(
+                f"[OpenAI] Unexpected error (attempt {attempt}/{max_retries}): {type(e).__name__}: {e}, "
+                f"model={model}"
+            )
+            if attempt == max_retries:
+                raise
 
-        else:
-            response_format = None
-            if is_json:
-                response_format = {"type": "json_object"}
-            if json_schema:  # 両方有効化されていたら、json_schemaを優先
-                response_format = json_schema
-
-            payload = {
-                "model": model,
-                "messages": messages,
-                "temperature": 0,
-                "n": 1,
-                "seed": 0,
-                "timeout": 30,
-            }
-            if response_format:
-                payload["response_format"] = response_format
-
-            response = client.chat.completions.create(**payload)
-
-            if hasattr(response, "usage") and response.usage:
-                token_usage_input = response.usage.prompt_tokens or 0
-                token_usage_output = response.usage.completion_tokens or 0
-                token_usage_total = response.usage.total_tokens or 0
-
-            return response.choices[0].message.content, token_usage_input, token_usage_output, token_usage_total
-    except openai.RateLimitError as e:
-        logging.warning(f"OpenAI API rate limit hit: {e}")
-        raise
-    except openai.AuthenticationError as e:
-        logging.error(f"OpenAI API authentication error: {str(e)}")
-        raise
-    except openai.BadRequestError as e:
-        logging.error(f"OpenAI API bad request error: {str(e)}")
-        raise
+    # すべてのリトライが失敗した場合
+    error_msg = f"Failed to get valid JSON response after {max_retries} attempts"
+    if last_error:
+        error_msg += f": {last_error}"
+    logging.error(f"[OpenAI] {error_msg}")
+    raise RuntimeError(error_msg)
 
 
 @retry(
@@ -152,12 +288,13 @@ def request_to_azure_chatcompletion(
                 n=1,
                 seed=0,
                 response_format=json_schema,
-                timeout=30,
+                timeout=LLM_REQUEST_TIMEOUT,
             )
             if hasattr(response, "usage") and response.usage:
                 token_usage_input = response.usage.prompt_tokens or 0
                 token_usage_output = response.usage.completion_tokens or 0
                 token_usage_total = response.usage.total_tokens or 0
+            logging.info(f"[Azure] Request successful, tokens: {token_usage_total}")
             return (
                 response.choices[0].message.parsed.model_dump(),
                 token_usage_input,
@@ -171,13 +308,15 @@ def request_to_azure_chatcompletion(
             if json_schema:  # 両方有効化されていたら、json_schemaを優先
                 response_format = json_schema
 
+            logging.info(f"[Azure] Requesting with deployment={deployment}, is_json={is_json}")
+
             payload = {
                 "model": deployment,
                 "messages": messages,
                 "temperature": 0,
                 "n": 1,
                 "seed": 0,
-                "timeout": 30,
+                "timeout": LLM_REQUEST_TIMEOUT,
             }
             if response_format:
                 payload["response_format"] = response_format
@@ -189,15 +328,16 @@ def request_to_azure_chatcompletion(
                 token_usage_output = response.usage.completion_tokens or 0
                 token_usage_total = response.usage.total_tokens or 0
 
+            logging.info(f"[Azure] Request successful, tokens: {token_usage_total}")
             return response.choices[0].message.content, token_usage_input, token_usage_output, token_usage_total
     except openai.RateLimitError as e:
-        logging.warning(f"OpenAI API rate limit hit: {e}")
+        logging.warning(f"[Azure] API rate limit hit: {e}")
         raise
     except openai.AuthenticationError as e:
-        logging.error(f"OpenAI API authentication error: {str(e)}")
+        logging.error(f"[Azure] API authentication error: {str(e)}")
         raise
     except openai.BadRequestError as e:
-        logging.error(f"OpenAI API bad request error: {str(e)}")
+        logging.error(f"[Azure] API bad request error: {str(e)}, messages={messages[:100]}...")
         raise
 
 
@@ -454,13 +594,15 @@ def request_to_local_llm(
                 },
             }
 
+        logging.info(f"[LocalLLM] Requesting with model={model}, address={address}, is_json={is_json}")
+
         payload = {
             "model": model,
             "messages": messages,
             "temperature": 0,
             "n": 1,
             "seed": 0,
-            "timeout": 30,
+            "timeout": LLM_REQUEST_TIMEOUT,
         }
 
         if response_format:
@@ -473,10 +615,12 @@ def request_to_local_llm(
             token_usage_output = response.usage.completion_tokens or 0
             token_usage_total = response.usage.total_tokens or 0
 
+        logging.info(f"[LocalLLM] Request successful, tokens: {token_usage_total}")
         return response.choices[0].message.content, token_usage_input, token_usage_output, token_usage_total
     except Exception as e:
         logging.error(
-            f"LocalLLM API error: {e}, model:{model}, address:{address}, is_json:{is_json}, json_schema:{json_schema}, response_format:{response_format}"
+            f"[LocalLLM] API error: {e}, model={model}, address={address}, is_json={is_json}, "
+            f"json_schema={json_schema}, response_format={response_format}, messages={messages[:100]}..."
         )
         raise
 
@@ -872,6 +1016,8 @@ def request_to_openrouter_chatcompletion(
     )
 
     try:
+        logging.info(f"[OpenRouter] Requesting with model={model}, is_json={is_json}")
+
         if isinstance(json_schema, type) and issubclass(json_schema, BaseModel):
             response = client.beta.chat.completions.parse(
                 model=model,
@@ -880,12 +1026,13 @@ def request_to_openrouter_chatcompletion(
                 n=1,
                 seed=0,
                 response_format=json_schema,
-                timeout=30,
+                timeout=LLM_REQUEST_TIMEOUT,
             )
             if hasattr(response, "usage") and response.usage:
                 token_usage_input = response.usage.prompt_tokens or 0
                 token_usage_output = response.usage.completion_tokens or 0
                 token_usage_total = response.usage.total_tokens or 0
+            logging.info(f"[OpenRouter] Request successful, tokens: {token_usage_total}")
             return response.choices[0].message.content, token_usage_input, token_usage_output, token_usage_total
         else:
             payload = {
@@ -894,7 +1041,7 @@ def request_to_openrouter_chatcompletion(
                 "temperature": 0,
                 "n": 1,
                 "seed": 0,
-                "timeout": 30,
+                "timeout": LLM_REQUEST_TIMEOUT,
             }
 
             if is_json:
@@ -907,15 +1054,16 @@ def request_to_openrouter_chatcompletion(
                 token_usage_input = response.usage.prompt_tokens or 0
                 token_usage_output = response.usage.completion_tokens or 0
                 token_usage_total = response.usage.total_tokens or 0
+            logging.info(f"[OpenRouter] Request successful, tokens: {token_usage_total}")
             return response.choices[0].message.content, token_usage_input, token_usage_output, token_usage_total
     except openai.RateLimitError as e:
-        logging.warning(f"OpenRouter API rate limit hit: {e}")
+        logging.warning(f"[OpenRouter] API rate limit hit: {e}")
         raise
     except openai.AuthenticationError as e:
-        logging.error(f"OpenRouter API authentication error: {str(e)}")
+        logging.error(f"[OpenRouter] API authentication error: {str(e)}, model={model}")
         raise
     except openai.BadRequestError as e:
-        logging.error(f"OpenRouter API bad request error: {str(e)}")
+        logging.error(f"[OpenRouter] API bad request error: {str(e)}, model={model}, messages={messages[:100]}...")
         raise
 
 

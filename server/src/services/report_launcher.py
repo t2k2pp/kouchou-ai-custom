@@ -19,6 +19,19 @@ logger = setup_logger()
 def _build_config(report_input: ReportInput) -> dict[str, Any]:
     comment_num = len(report_input.comments)
 
+    # フェーズ固有のAI設定を準備
+    ai_phase_settings = report_input.ai_phase_settings
+
+    def _build_ai_config(phase_settings):
+        """フェーズ固有のAI設定を構築するヘルパー関数"""
+        if phase_settings:
+            return {
+                "provider": phase_settings.provider,
+                "model": phase_settings.model,
+                "user_api_key": phase_settings.user_api_key,
+            }
+        return None
+
     config = {
         "name": report_input.input,
         "input": report_input.input,
@@ -26,6 +39,7 @@ def _build_config(report_input: ReportInput) -> dict[str, Any]:
         "intro": report_input.intro,
         "model": report_input.model,
         "provider": report_input.provider,
+        "user_api_key": report_input.user_api_key,
         "is_pubcom": report_input.is_pubcom,
         "is_embedded_at_local": report_input.is_embedded_at_local,
         "local_llm_address": report_input.local_llm_address,
@@ -33,6 +47,10 @@ def _build_config(report_input: ReportInput) -> dict[str, Any]:
             "prompt": report_input.prompt.extraction,
             "workers": report_input.workers,
             "limit": comment_num,
+            "ai_config": _build_ai_config(ai_phase_settings.extraction if ai_phase_settings else None),
+        },
+        "embedding": {
+            "ai_config": _build_ai_config(ai_phase_settings.embedding if ai_phase_settings else None),
         },
         "hierarchical_clustering": {
             "cluster_nums": report_input.cluster,
@@ -41,13 +59,18 @@ def _build_config(report_input: ReportInput) -> dict[str, Any]:
             "prompt": report_input.prompt.initial_labelling,
             "sampling_num": 30,
             "workers": report_input.workers,
+            "ai_config": _build_ai_config(ai_phase_settings.initial_labelling if ai_phase_settings else None),
         },
         "hierarchical_merge_labelling": {
             "prompt": report_input.prompt.merge_labelling,
             "sampling_num": 30,
             "workers": report_input.workers,
+            "ai_config": _build_ai_config(ai_phase_settings.merge_labelling if ai_phase_settings else None),
         },
-        "hierarchical_overview": {"prompt": report_input.prompt.overview},
+        "hierarchical_overview": {
+            "prompt": report_input.prompt.overview,
+            "ai_config": _build_ai_config(ai_phase_settings.overview if ai_phase_settings else None),
+        },
         "hierarchical_aggregation": {
             "sampling_num": report_input.workers,
         },

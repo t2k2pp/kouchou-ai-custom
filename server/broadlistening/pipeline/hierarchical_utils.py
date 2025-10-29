@@ -241,56 +241,100 @@ def run_step(step, func, config):
     if not plan["run"]:
         print(f"Skipping '{step}'")
         return
-    # update status before running...
-    update_status(
-        config,
-        {
-            "current_job": step,
-            "current_job_started": datetime.now().isoformat(),
-        },
-    )
-    print("Running step:", step)
-    # run the step...
-    token_usage_before = config.get("total_token_usage", 0)
-    func(config)
-    token_usage_after = config.get("total_token_usage", token_usage_before)
-    token_usage_step = token_usage_after - token_usage_before
 
-    estimated_cost = 0.0
-    provider = config.get("provider")
-    model = config.get("model")
-    token_usage_input = config.get("token_usage_input", 0)
-    token_usage_output = config.get("token_usage_output", 0)
+    # ステップレベルのリトライ設定
+    max_step_retries = 3
+    retry_delay = 10  # 秒
 
-    if provider and model and token_usage_input > 0 and token_usage_output > 0:
-        if LLMPricing:
-            estimated_cost = LLMPricing.calculate_cost(provider, model, token_usage_input, token_usage_output)
-            print(f"Estimated cost: ${estimated_cost:.4f} ({provider} {model})")
-        else:
+    for attempt in range(1, max_step_retries + 1):
+        try:
+            # update status before running...
+            status_update = {
+                "current_job": step,
+                "current_job_started": datetime.now().isoformat(),
+            }
+            if attempt > 1:
+                status_update["current_job_retry_attempt"] = attempt
+            update_status(config, status_update)
+
+            if attempt == 1:
+                print(f"Running step: {step}")
+            else:
+                print(f"Retrying step: {step} (attempt {attempt}/{max_step_retries})")
+
+            # run the step...
+            token_usage_before = config.get("total_token_usage", 0)
+            func(config)
+            token_usage_after = config.get("total_token_usage", token_usage_before)
+            token_usage_step = token_usage_after - token_usage_before
+
             estimated_cost = 0.0
+            provider = config.get("provider")
+            model = config.get("model")
+            token_usage_input = config.get("token_usage_input", 0)
+            token_usage_output = config.get("token_usage_output", 0)
 
-    # update status after running...
-    update_status(
-        config,
-        {
-            "current_job_progress": None,
-            "current_jop_tasks": None,
-            "completed_jobs": config.get("completed_jobs", [])
-            + [
+            if provider and model and token_usage_input > 0 and token_usage_output > 0:
+                if LLMPricing:
+                    estimated_cost = LLMPricing.calculate_cost(provider, model, token_usage_input, token_usage_output)
+                    print(f"Estimated cost: ${estimated_cost:.4f} ({provider} {model})")
+                else:
+                    estimated_cost = 0.0
+
+            # update status after running...
+            update_status(
+                config,
                 {
-                    "step": step,
-                    "completed": datetime.now().isoformat(),
-                    "duration": (
-                        datetime.fromisoformat(datetime.now().isoformat())
-                        - datetime.fromisoformat(config["current_job_started"])
-                    ).total_seconds(),
-                    "params": config[step],
-                    "token_usage": token_usage_step,  # ステップ毎のトークン使用量を追加
-                }
-            ],
-            "estimated_cost": estimated_cost,  # 推定コストを追加
-        },
-    )
+                    "current_job_progress": None,
+                    "current_jop_tasks": None,
+                    "current_job_retry_attempt": None,
+                    "completed_jobs": config.get("completed_jobs", [])
+                    + [
+                        {
+                            "step": step,
+                            "completed": datetime.now().isoformat(),
+                            "duration": (
+                                datetime.fromisoformat(datetime.now().isoformat())
+                                - datetime.fromisoformat(config["current_job_started"])
+                            ).total_seconds(),
+                            "params": config[step],
+                            "token_usage": token_usage_step,  # ステップ毎のトークン使用量を追加
+                            "retry_attempts": attempt if attempt > 1 else 0,  # リトライ回数を記録
+                        }
+                    ],
+                    "estimated_cost": estimated_cost,  # 推定コストを追加
+                },
+            )
+
+            # ステップが成功したのでリトライループを抜ける
+            if attempt > 1:
+                print(f"Step '{step}' succeeded after {attempt} attempts")
+            return
+
+        except Exception as e:
+            error_msg = f"{type(e).__name__}: {e}"
+            print(f"Error in step '{step}' (attempt {attempt}/{max_step_retries}): {error_msg}")
+
+            if attempt < max_step_retries:
+                print(f"Waiting {retry_delay} seconds before retry...")
+                import time
+
+                time.sleep(retry_delay)
+                # 次回のリトライのために遅延時間を増やす（指数バックオフ）
+                retry_delay *= 2
+            else:
+                # 最大リトライ回数に達したのでエラーを再スロー
+                print(f"Step '{step}' failed after {max_step_retries} attempts")
+                update_status(
+                    config,
+                    {
+                        "current_job_retry_attempt": None,
+                        "last_failed_step": step,
+                        "last_failed_step_error": error_msg,
+                        "last_failed_step_traceback": traceback.format_exc(),
+                    },
+                )
+                raise
 
 
 def termination(config, error=None):

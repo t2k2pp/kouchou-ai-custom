@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 from concurrent.futures import ThreadPoolExecutor
 from functools import partial
@@ -29,18 +30,27 @@ def hierarchical_initial_labelling(config: dict) -> None:
                 - prompt: LLMへのプロンプト
                 - model: 使用するLLMモデル名
                 - workers: 並列処理のワーカー数
+                - ai_config: フェーズ固有のAI設定（オプション）
             - provider: LLMプロバイダー
     """
     dataset = config["output_dir"]
     path = f"outputs/{dataset}/hierarchical_initial_labels.csv"
     clusters_argument_df = pd.read_csv(f"outputs/{dataset}/hierarchical_clusters.csv")
 
+    # フェーズ固有のAI設定を取得（なければデフォルト設定を使用）
+    initial_labelling_config = config["hierarchical_initial_labelling"]
+    ai_config = initial_labelling_config.get("ai_config", {})
+    model = ai_config.get("model") or initial_labelling_config.get("model") or config["model"]
+    provider = ai_config.get("provider") or config["provider"]
+    user_api_key = ai_config.get("user_api_key") or config.get("user_api_key")
+
     cluster_id_columns = [col for col in clusters_argument_df.columns if col.startswith("cluster-level-")]
     initial_cluster_id_column = cluster_id_columns[-1]
-    sampling_num = config["hierarchical_initial_labelling"]["sampling_num"]
-    initial_labelling_prompt = config["hierarchical_initial_labelling"]["prompt"]
-    model = config["hierarchical_initial_labelling"]["model"]
-    workers = config["hierarchical_initial_labelling"]["workers"]
+    sampling_num = initial_labelling_config["sampling_num"]
+    initial_labelling_prompt = initial_labelling_config["prompt"]
+    workers = initial_labelling_config["workers"]
+
+    logging.info(f"[InitialLabelling] Using provider={provider}, model={model}")
 
     # トークン使用量を追跡するための変数を初期化
     config["total_token_usage"] = config.get("total_token_usage", 0)
@@ -51,8 +61,9 @@ def hierarchical_initial_labelling(config: dict) -> None:
         sampling_num,
         model,
         workers,
-        config["provider"],
+        provider,
         config.get("local_llm_address"),
+        user_api_key,
         config,  # configを渡して、トークン使用量を累積できるようにする
     )
     print("start initial labelling")
@@ -79,6 +90,7 @@ def initial_labelling(
     workers: int,
     provider: str = "openai",
     local_llm_address: str | None = None,
+    user_api_key: str | None = None,
     config: dict | None = None,  # configを追加
 ) -> pd.DataFrame:
     """各クラスタに対して初期ラベリングを実行する
@@ -91,6 +103,7 @@ def initial_labelling(
         workers: 並列処理のワーカー数
         provider: LLMプロバイダー
         local_llm_address: ローカルLLMのアドレス
+        user_api_key: ユーザー提供のAPIキー
         config: 設定情報を含む辞書（トークン使用量の累積に使用）
 
     Returns:
@@ -108,6 +121,7 @@ def initial_labelling(
         model=model,
         provider=provider,
         local_llm_address=local_llm_address,
+        user_api_key=user_api_key,
         config=config,  # configを渡す
     )
     with ThreadPoolExecutor(max_workers=workers) as executor:
@@ -131,6 +145,7 @@ def process_initial_labelling(
     model: str,
     provider: str = "openai",
     local_llm_address: str | None = None,
+    user_api_key: str | None = None,
     config: dict | None = None,  # configを追加
 ) -> LabellingResult:
     """個別のクラスタに対してラベリングを実行する
@@ -144,6 +159,7 @@ def process_initial_labelling(
         model: 使用するLLMモデル名
         provider: LLMプロバイダー
         local_llm_address: ローカルLLMのアドレス
+        user_api_key: ユーザー提供のAPIキー
         config: 設定情報を含む辞書（トークン使用量の累積に使用）
 
     Returns:
@@ -164,7 +180,7 @@ def process_initial_labelling(
             provider=provider,
             json_schema=LabellingFromat,
             local_llm_address=local_llm_address,
-            user_api_key=os.getenv("USER_API_KEY"),
+            user_api_key=user_api_key,
         )
 
         # トークン使用量を累積（configが渡されている場合）

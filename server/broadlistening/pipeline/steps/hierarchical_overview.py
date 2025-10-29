@@ -1,6 +1,7 @@
 """Create summaries for the clusters."""
 
 import json
+import logging
 import os
 import re
 
@@ -20,8 +21,16 @@ def hierarchical_overview(config):
 
     hierarchical_label_df = pd.read_csv(f"outputs/{dataset}/hierarchical_merge_labels.csv")
 
-    prompt = config["hierarchical_overview"]["prompt"]
-    model = config["hierarchical_overview"]["model"]
+    # フェーズ固有のAI設定を取得（なければデフォルト設定を使用）
+    overview_config = config["hierarchical_overview"]
+    ai_config = overview_config.get("ai_config", {})
+    model = ai_config.get("model") or overview_config.get("model") or config["model"]
+    provider = ai_config.get("provider") or config["provider"]
+    user_api_key = ai_config.get("user_api_key") or config.get("user_api_key")
+
+    logging.info(f"[HierarchicalOverview] Using provider={provider}, model={model}")
+
+    prompt = overview_config["prompt"]
 
     # TODO: level1で固定にしているが、設定で変えられるようにする
     target_level = 1
@@ -40,9 +49,9 @@ def hierarchical_overview(config):
     response_text, token_input, token_output, token_total = request_to_chat_ai(
         messages=messages,
         model=model,
-        provider=config["provider"],
+        provider=provider,
         local_llm_address=config.get("local_llm_address"),
-        user_api_key=os.getenv("USER_API_KEY"),
+        user_api_key=user_api_key,
         json_schema=OverviewResponse,
     )
 
