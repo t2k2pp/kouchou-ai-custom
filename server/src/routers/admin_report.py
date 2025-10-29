@@ -361,3 +361,24 @@ async def get_llm_pricing(api_key: str = Depends(verify_admin_api_key)) -> dict:
     except Exception as e:
         slogger.error(f"Exception in get_llm_pricing: {e}", exc_info=True)
         raise HTTPException(status_code=500, detail="Internal server error") from e
+
+
+@router.get("/admin/queue/status")
+async def get_queue_status(api_key: str = Depends(verify_admin_api_key)) -> dict:
+    """レポート生成キューの状態を取得するエンドポイント
+
+    Returns:
+        dict: キューの状態情報
+            - queue_length: キューに待機中のレポート数
+            - is_processing: 現在処理中かどうか
+            - current_job: 現在処理中のレポートslug（処理中の場合）
+            - worker_alive: ワーカースレッドが稼働中かどうか
+    """
+    try:
+        from src.services.report_queue import get_queue_manager
+
+        queue_manager = get_queue_manager()
+        return queue_manager.get_queue_status()
+    except Exception as e:
+        slogger.error(f"Exception in get_queue_status: {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail="Internal server error") from e

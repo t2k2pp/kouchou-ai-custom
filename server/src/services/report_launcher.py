@@ -179,25 +179,23 @@ def _monitor_process(process: subprocess.Popen, slug: str) -> None:
 
 def launch_report_generation(report_input: ReportInput, user_api_key: str | None = None) -> None:
     """
-    外部ツールの main.py を subprocess で呼び出してレポート生成処理を開始する関数。
+    レポート生成をキューに追加する関数。
+    キューマネージャーが順次処理を行います（複数リクエストがあっても1つずつ処理）。
+
+    Args:
+        report_input: レポート作成リクエスト
+        user_api_key: ユーザー提供のAPIキー（オプション）
     """
     try:
-        add_new_report_to_status(report_input)
-        config_path = save_config_file(report_input)
-        save_input_file(report_input)
-        cmd = ["python", "hierarchical_main.py", config_path, "--skip-interaction", "--without-html"]
-        execution_dir = settings.TOOL_DIR / "pipeline"
+        from src.services.report_queue import get_queue_manager
 
-        env = os.environ.copy()
-        if user_api_key:
-            env["USER_API_KEY"] = user_api_key
+        queue_manager = get_queue_manager()
+        slug = queue_manager.add_to_queue(report_input, user_api_key)
+        logger.info(f"Report {slug} added to queue for sequential processing")
 
-        process = subprocess.Popen(cmd, cwd=execution_dir, env=env)
-        threading.Thread(target=_monitor_process, args=(process, report_input.input), daemon=True).start()
     except Exception as e:
-        set_status(report_input.input, "error")
-        logger.error(f"Error launching report generation: {e}")
-        raise e
+        logger.error(f"Error adding report to queue: {e}", exc_info=True)
+        raise
 
 
 def execute_aggregation(slug: str, user_api_key: str | None = None) -> bool:
